@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+numpy
+scikit-learn
+matplotlib
+seaborn
+pillow
+joblib
+opencv-python
