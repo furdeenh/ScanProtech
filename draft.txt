@@ -1,213 +1,207 @@
+import random
+import time
+import os
+import board
+import threading 
+from adafruit_motorkit import MotorKit
+from adafruit_motor import stepper
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.anchorlayout import AnchorLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.image import Image
+from kivy.clock import Clock
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from datetime import datetime
+from kivy.graphics import Color, Rectangle
+from kivy.uix.floatlayout import FloatLayout
+import requests
+
+# Global Variables
+data_matrix = []
+IMAGE_DIRECTORY = "/home/furdeengregg/Desktop/Senior Design Team & Gregg Data Collection/KIVY GUI"
+current_x_velocity = 0
+current_y_velocity = 0.0
+x_velocities = []
+y_velocities = []
+
+# Helper Functions
+
+def move_motor(motor, steps, direction):
+    start_time = time.time()
+    for _ in range(steps):
+        motor.onestep(direction=direction)
+        time.sleep(0.002)
+    return time.time() - start_time
+
+def acquire_adc_data(chan, rate, data_list, stop_event):
+    interval = 1 / rate
+    while not stop_event.is_set():
+        data_list.append(chan.voltage)
+        time.sleep(interval)
+
+def reset_axes(motor_x, motor_y, steps_per_mm, travel_distance_x=110, travel_distance_y=130):
+    x_steps = int((travel_distance_x - 5) * steps_per_mm)
+    y_steps = int(travel_distance_y * steps_per_mm)
+    move_motor(motor_y, y_steps, stepper.BACKWARD)
+    move_motor(motor_x, x_steps, stepper.BACKWARD)
+
+def move_third_actuator(motor_z, distance_mm, steps_per_mm=10):
+    steps = int(distance_mm * steps_per_mm)
+    for _ in range(steps):
+        motor_z.onestep(direction=stepper.FORWARD)
+        time.sleep(0.01)
+
+def move_in_zigzag_pattern(motor_x, motor_y, chan, rate, y_step, steps_per_mm, update_vel):
+    global data_matrix, x_velocities, y_velocities
+    data_matrix = []
+    total_x_steps = int(110 * steps_per_mm)
+    total_y_steps = int(y_step * steps_per_mm)
+    y_increments = int(130 / y_step)
+    stop_event = threading.Event()
+
+    for i in range(y_increments):
+        row_data = []
+        stop_event.clear()
+        t = threading.Thread(target=acquire_adc_data, args=(chan, rate, row_data, stop_event))
+        t.start()
+        duration = move_motor(motor_x, total_x_steps, stepper.FORWARD if i % 2 == 0 else stepper.BACKWARD)
+        stop_event.set()
+        t.join()
+        if i % 2 == 1:
+            row_data.reverse()
+        data_matrix.append(row_data)
+        move_motor(motor_y, total_y_steps, stepper.FORWARD)
+        x_velocities.append(110 / duration)
+        y_velocities.append(y_step / (0.002 * total_y_steps))
+
+    Clock.schedule_once(lambda dt: update_vel(np.mean(x_velocities), np.mean(y_velocities)))
+
+def generate_heatmap(data_matrix):
+    max_len = max(len(row) for row in data_matrix)
+    padded = np.full((len(data_matrix), max_len), np.nan)
+    for i, row in enumerate(data_matrix):
+        padded[i, :len(row)] = row
+    filtered = gaussian_filter(np.nan_to_num(padded), sigma=1)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(filtered, cmap="coolwarm", xticklabels=False, yticklabels=False,
+                mask=np.isnan(padded), cbar_kws={'label': 'Voltage (V)', 'shrink': 0.8})
+    plt.title('mmWave Signal Intensity (V)')
+    plt.xlabel('X Position (cm)')
+    plt.ylabel('Y Position (cm)')
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fname = os.path.join(IMAGE_DIRECTORY, f"heatmap_{timestamp}.png")
+    plt.savefig(fname)
+    return fname
+
+# Screens
+
+class IntroScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        layout = AnchorLayout()
+        layout.add_widget(Image(source='/home/furdeengregg/Downloads/Scan.png', size_hint=(None, None), size=(500, 500)))
+        self.add_widget(layout)
+
+    def on_enter(self):
+        Clock.schedule_once(lambda dt: setattr(self.manager, 'current', 'main'), 5)
+
 class MainScreen(Screen):
     def __init__(self, **kwargs):
-        super(MainScreen, self).__init__(**kwargs)
-
-        # Initialize MotorKit instances
+        super().__init__(**kwargs)
         self.kit1 = MotorKit(address=0x60)
         self.kit2 = MotorKit(address=0x61)
-
+        self.motor_x, self.motor_y, self.motor_z = self.kit1.stepper1, self.kit1.stepper2, self.kit2.stepper1
         self.steps_per_mm = 200 / (2 * 3.14 * 10)
+        self.chan = AnalogIn(ADS.ADS1115(board.I2C()), ADS.P0)
 
-        self.motor_x = self.kit1.stepper1
-        self.motor_y = self.kit1.stepper2
-        self.motor_z = self.kit2.stepper1
+        layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
+        layout.add_widget(Label(text="ScanProTech", font_size='40sp', color=(1, 0, 0, 1), size_hint=(1, None), height=50))
 
-        i2c = board.I2C()
-        ads = ADS.ADS1115(i2c)
-        self.chan = AnalogIn(ads, ADS.P0)
+        content = BoxLayout(orientation='horizontal', spacing=10)
+        left = BoxLayout(orientation='vertical', spacing=10, size_hint=(0.6, 1))
+        self.image_widget = Image(size_hint=(1, 0.7))
+        left.add_widget(self.image_widget)
 
-        main_layout = BoxLayout(orientation='vertical', padding=20, spacing=20)
+        self.feedback_box = Label(text="", size_hint=(1, None), height=150,
+                                   color=(1, 1, 1, 1), halign="left", valign="top")
+        with self.feedback_box.canvas.before:
+            Color(1, 1, 1, 1)
+            self.feedback_bg = Rectangle(pos=self.feedback_box.pos, size=self.feedback_box.size)
+        self.feedback_box.bind(pos=self.update_feedback_bg, size=self.update_feedback_bg)
+        left.add_widget(self.feedback_box)
 
-        # Title
-        title_box = BoxLayout(size_hint=(1, None), height=60)
-        title_label = Label(text="ScanProTech", font_size='40sp', color=(1, 0, 0, 1), bold=True)
-        title_box.add_widget(title_label)
-        main_layout.add_widget(title_box)
+        btn_box = BoxLayout(size_hint=(1, None), height=50)
+        self.scan_btn = Button(text="Scan Now")
+        self.scan_btn.bind(on_release=self.start_scan)
+        btn_box.add_widget(Button(text="Previous Scans"))
+        btn_box.add_widget(self.scan_btn)
+        left.add_widget(btn_box)
 
-        content_layout = BoxLayout(orientation='horizontal', spacing=20)
+        self.scanned_image_label = Label(text="", size_hint=(1, None), height=30)
+        left.add_widget(self.scanned_image_label)
+        content.add_widget(left)
+        layout.add_widget(content)
+        self.add_widget(layout)
 
-        # Left Layout
-        left_layout = BoxLayout(orientation='vertical', spacing=10, size_hint=(0.8, 1))
+    def update_feedback_bg(self, *args):
+        self.feedback_bg.pos = self.feedback_box.pos
+        self.feedback_bg.size = self.feedback_box.size
 
-        # Heatmap Image Container
-        image_container = FloatLayout(size_hint=(1, 0.7))
-        with image_container.canvas.before:
-            Color(0, 0, 0, 1)
-            self.bg_rect = Rectangle(size=image_container.size, pos=image_container.pos)
-        image_container.bind(pos=self.update_bg_rect, size=self.update_bg_rect)
+    def update_velocity_display(self, x, y):
+        print(f"X Velocity: {x:.2f} mm/s, Y Velocity: {y:.2f} mm/s")
 
-        self.image_widget = Image(source="", size_hint=(1, 1), opacity=0)
-        image_container.add_widget(self.image_widget)
-        left_layout.add_widget(image_container)
-
-        # Scanned label (top feedback)
-        self.scanned_image_label = Label(text="Scanned Image displayed Here", font_size='20sp', size_hint=(1, None), height=30)
-        left_layout.add_widget(self.scanned_image_label)
-
-        # ✨ AI Feedback Label (new)
-        self.ai_feedback_label = Label(
-            text="[AI Feedback will appear here]",
-            font_size='16sp',
-            halign='left',
-            valign='top',
-            size_hint=(1, None),
-            height=120
-        )
-        left_layout.add_widget(self.ai_feedback_label)
-
-        # Scan Buttons
-        bottom_buttons_layout = BoxLayout(orientation='horizontal', size_hint=(1, None), height=60, padding=(10, 10))
-        self.previous_scans_button = Button(text="Previous Scans")
-        self.scan_now_button = Button(text="Scan Now")
-        self.previous_scans_button.bind(on_release=self.open_previous_scans)
-        self.scan_now_button.bind(on_release=self.start_scan)
-        bottom_buttons_layout.add_widget(self.previous_scans_button)
-        bottom_buttons_layout.add_widget(self.scan_now_button)
-        left_layout.add_widget(bottom_buttons_layout)
-
-        # ADC Display
-        adc_box = BoxLayout(orientation='vertical', padding=10, spacing=10, size_hint=(1, None), height=100)
-        adc_label = Label(text="RAW ADC Values", font_size='20sp', bold=True)
-        adc_box.add_widget(adc_label)
-        self.adc_data_display = []
-        for i in range(5):
-            label = Label(text=f"Fetching ADC Data {i + 1}...", font_size='16sp')
-            self.adc_data_display.append(label)
-            adc_box.add_widget(label)
-        left_layout.add_widget(adc_box)
-
-        # Right Layout for controls
-        right_layout = BoxLayout(orientation='vertical', spacing=20, size_hint=(0.4, 1))
-
-        # Stage Controls
-        stages_box = BoxLayout(orientation='vertical', spacing=10)
-        stages_label = Label(text="Stages", font_size='20sp', bold=True)
-        stages_box.add_widget(stages_label)
-
-        sampling_layout = BoxLayout(orientation='horizontal', spacing=5)
-        sampling_layout.add_widget(Label(text="Sampling Rate:"))
-        self.sampling_rate_input = TextInput(hint_text="Enter Sampling Rate", multiline=False)
-        sampling_layout.add_widget(self.sampling_rate_input)
-        stages_box.add_widget(sampling_layout)
-
-        y_axis_layout = BoxLayout(orientation='horizontal', spacing=5)
-        y_axis_layout.add_widget(Label(text="Y-axis:"))
-        self.y_axis_input = TextInput(hint_text="Enter Y-axis Value", multiline=False)
-        y_axis_layout.add_widget(self.y_axis_input)
-        stages_box.add_widget(y_axis_layout)
-
-        z_axis_layout = BoxLayout(orientation='horizontal', spacing=5)
-        z_axis_layout.add_widget(Label(text="Z-axis:"))
-        self.z_axis_input = TextInput(hint_text="Enter Z-axis Value", multiline=False)
-        z_axis_layout.add_widget(self.z_axis_input)
-        stages_box.add_widget(z_axis_layout)
-
-        right_layout.add_widget(stages_box)
-
-        # Velocity Display
-        velocity_box = BoxLayout(orientation='vertical', spacing=10, size_hint=(1, None), height=150)
-        velocity_box.add_widget(Label(text="Velocity", font_size='20sp', bold=True))
-        self.velocity_inputs = {}
-        for axis in ['X', 'Y', 'Z']:
-            axis_layout = BoxLayout(orientation='horizontal', spacing=5)
-            axis_layout.add_widget(Label(text=f"{axis}-axis:"))
-            axis_input = TextInput(text="0.00 mm/s", readonly=True, multiline=False, background_color=(0.9, 0.9, 0.9, 1))
-            axis_layout.add_widget(axis_input)
-            velocity_box.add_widget(axis_layout)
-            self.velocity_inputs[axis] = axis_input
-        right_layout.add_widget(velocity_box)
-
-        # Display Position
-        display_position_box = BoxLayout(orientation='vertical', spacing=10)
-        display_position_box.add_widget(Label(text="Display Position", font_size='20sp', bold=True))
-        self.display_position_inputs = {}
-        for axis in ['X', 'Y', 'Z']:
-            axis_layout = BoxLayout(orientation='horizontal', spacing=5)
-            axis_layout.add_widget(Label(text=f"{axis}-axis:"))
-            axis_display = TextInput(hint_text=f"{axis}-axis Position", readonly=True, multiline=False)
-            axis_layout.add_widget(axis_display)
-            display_position_box.add_widget(axis_layout)
-            self.display_position_inputs[axis] = axis_display
-        right_layout.add_widget(display_position_box)
-
-        content_layout.add_widget(left_layout)
-        content_layout.add_widget(right_layout)
-        main_layout.add_widget(content_layout)
-        self.add_widget(main_layout)
-
-        # ADC updates
-        Clock.schedule_interval(self.update_adc_data, 0.1)
-
-    def update_bg_rect(self, instance, value):
-        self.bg_rect.size = instance.size
-        self.bg_rect.pos = instance.pos
-
-    def update_velocity_display(self, x_velocity, y_velocity):
-        self.velocity_inputs['X'].text = f"{x_velocity:.2f} mm/s"
-        self.velocity_inputs['Y'].text = f"{y_velocity:.2f} mm/s"
-        self.velocity_inputs['Z'].text = "0.00 mm/s"
-
-    def update_adc_data(self, dt):
+    def analyze_image_with_ai(self, path):
         try:
-            adc_value = self.chan.voltage
-            for i, label in enumerate(self.adc_data_display):
-                label.text = f"ADC Value {i + 1}: {adc_value:.2f} V"
-        except Exception as e:
-            for label in self.adc_data_display:
-                label.text = f"Error reading ADC: {e}"
-
-    def analyze_image_with_ai(self, image_path):
-        try:
-            url = "http://127.0.0.1:8000/analyze"
-            with open(image_path, "rb") as image_file:
-                files = {"file": image_file}
-                response = requests.post(url, files=files)
-            return response.json() if response.ok else {"error": "API error"}
+            r = requests.post("http://127.0.0.1:8000/analyze", files={"file": open(path, "rb")})
+            return r.json() if r.ok else {"error": "Invalid response"}
         except Exception as e:
             return {"error": str(e)}
 
-    def start_scan(self, *args):
+    def start_scan(self, *_):
         try:
-            sampling_rate = float(self.sampling_rate_input.text)
-            y_axis_value = float(self.y_axis_input.text)
-            z_axis_value = float(self.z_axis_input.text)
-
-            move_third_actuator(self.motor_z, z_axis_value)
+            sampling = 100.0
+            y_val = 10.0
+            z_val = 0.0
+            move_third_actuator(self.motor_z, z_val)
             reset_axes(self.motor_x, self.motor_y, self.steps_per_mm)
-
-            move_in_zigzag_pattern(
-                self.motor_x, self.motor_y, self.chan,
-                sampling_rate, y_axis_value, self.steps_per_mm,
-                update_velocity=self.update_velocity_display
-            )
-
-            image_path = generate_heatmap(data_matrix)
-            analysis_result = self.analyze_image_with_ai(image_path)
-
-            self.image_widget.source = image_path
-            self.image_widget.opacity = 1
+            move_in_zigzag_pattern(self.motor_x, self.motor_y, self.chan, sampling, y_val, self.steps_per_mm, self.update_velocity_display)
+            path = generate_heatmap(data_matrix)
+            self.image_widget.source = path
             self.image_widget.reload()
-            self.scanned_image_label.text = "Scanning Complete. Heatmap displayed above."
-
-            if "error" in analysis_result:
-                self.ai_feedback_label.text = f"[AI Error] {analysis_result['error']}"
+            self.image_widget.opacity = 1
+            result = self.analyze_image_with_ai(path)
+            if "error" in result:
+                self.feedback_box.text = f"[AI Error]\n{result['error']}"
             else:
-                heur = analysis_result.get("heuristic", {})
-                self.ai_feedback_label.text = (
-                    "[AI Feedback]\n"
-                    f"- Object: {heur.get('object', 'N/A')}\n"
-                    f"- Confidence Score: {heur.get('confidence_score', 'N/A')}\n"
-                    f"- Sharpness: {heur.get('sharpness', 'N/A')}\n"
-                    f"- Feedback: {heur.get('description', 'N/A')}"
-                )
+                heur = result.get("heuristic", {})
+                desc = (f"AI Feedback:\n"
+                        f"- Object: {heur.get('object', 'N/A')}\n"
+                        f"- Confidence Score: {heur.get('threat_score', 'N/A')}\n"
+                        f"- Sharpness: {heur.get('sharpness', 'N/A')}\n"
+                        f"- Feedback: \"{heur.get('feedback', 'No comment')}\"")
+                self.feedback_box.text = desc
+            self.scanned_image_label.text = "Scanning Complete. Heatmap displayed above."
+        except Exception as e:
+            self.feedback_box.text = f"Error: {e}"
 
-            y_increments = int(130 / y_axis_value)
-            x_passes = len(data_matrix)
-            self.display_position_inputs['X'].text = str(x_passes)
-            self.display_position_inputs['Y'].text = str(y_increments)
-            self.display_position_inputs['Z'].text = "0.00 mm"
-        except ValueError:
-            self.scanned_image_label.text = "Invalid input. Please enter valid numbers."
+class mmWaveApp(App):
+    def build(self):
+        sm = ScreenManager()
+        sm.add_widget(IntroScreen(name='intro'))
+        sm.add_widget(MainScreen(name='main'))
+        sm.current = 'intro'
+        return sm
 
-    def open_previous_scans(self, *args):
-        self.manager.current = 'previous_scans'
+if __name__ == '__main__':
+    mmWaveApp().run()
+
