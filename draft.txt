@@ -1,119 +1,3 @@
-# scan.py (FINAL WORKING VERSION with AI FEEDBACK UI)
-
-import random
-import time
-import os
-import board
-import threading 
-from adafruit_motorkit import MotorKit
-from adafruit_motor import stepper
-import adafruit_ads1x15.ads1115 as ADS
-from adafruit_ads1x15.analog_in import AnalogIn
-from kivy.app import App
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.anchorlayout import AnchorLayout
-from kivy.uix.button import Button
-from kivy.uix.label import Label
-from kivy.uix.textinput import TextInput
-from kivy.uix.screenmanager import ScreenManager, Screen
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.image import Image
-from kivy.clock import Clock
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-from scipy.ndimage import gaussian_filter
-from datetime import datetime
-from kivy.graphics import Color, Rectangle
-from kivy.uix.floatlayout import FloatLayout
-import requests
-
-# Global Variables
-data_matrix = []
-IMAGE_DIRECTORY = "/home/furdeengregg/Desktop/Senior Design Team & Gregg Data Collection/KIVY GUI"
-x_velocities = []
-y_velocities = []
-
-# Helper Functions
-def move_motor(motor, steps, direction):
-    start_time = time.time()
-    for _ in range(steps):
-        motor.onestep(direction=direction)
-        time.sleep(0.002)
-    return time.time() - start_time
-
-def acquire_adc_data(chan, rate, data_list, stop_event):
-    interval = 1 / rate
-    while not stop_event.is_set():
-        data_list.append(chan.voltage)
-        time.sleep(interval)
-
-def reset_axes(motor_x, motor_y, steps_per_mm, travel_distance_x=110, travel_distance_y=130):
-    x_steps = int((travel_distance_x - 5) * steps_per_mm)
-    y_steps = int(travel_distance_y * steps_per_mm)
-    move_motor(motor_y, y_steps, stepper.BACKWARD)
-    move_motor(motor_x, x_steps, stepper.BACKWARD)
-
-def move_third_actuator(motor_z, distance_mm, steps_per_mm=10):
-    steps = int(distance_mm * steps_per_mm)
-    for _ in range(steps):
-        motor_z.onestep(direction=stepper.FORWARD)
-        time.sleep(0.01)
-
-def move_in_zigzag_pattern(motor_x, motor_y, chan, rate, y_step, steps_per_mm, update_vel):
-    global data_matrix, x_velocities, y_velocities
-    data_matrix = []
-    total_x_steps = int(110 * steps_per_mm)
-    total_y_steps = int(y_step * steps_per_mm)
-    y_increments = int(130 / y_step)
-    stop_event = threading.Event()
-
-    for i in range(y_increments):
-        row_data = []
-        stop_event.clear()
-        t = threading.Thread(target=acquire_adc_data, args=(chan, rate, row_data, stop_event))
-        t.start()
-        duration = move_motor(motor_x, total_x_steps, stepper.FORWARD if i % 2 == 0 else stepper.BACKWARD)
-        stop_event.set()
-        t.join()
-        if i % 2 == 1:
-            row_data.reverse()
-        data_matrix.append(row_data)
-        move_motor(motor_y, total_y_steps, stepper.FORWARD)
-        x_velocities.append(110 / duration)
-        y_velocities.append(y_step / (0.002 * total_y_steps))
-
-    Clock.schedule_once(lambda dt: update_vel(np.mean(x_velocities), np.mean(y_velocities)))
-
-def generate_heatmap(data_matrix):
-    max_len = max(len(row) for row in data_matrix)
-    padded = np.full((len(data_matrix), max_len), np.nan)
-    for i, row in enumerate(data_matrix):
-        padded[i, :len(row)] = row
-    filtered = gaussian_filter(np.nan_to_num(padded), sigma=1)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(filtered, cmap="coolwarm", xticklabels=False, yticklabels=False,
-                mask=np.isnan(padded), cbar_kws={'label': 'Voltage (V)', 'shrink': 0.8})
-    plt.title('mmWave Signal Intensity (V)')
-    plt.xlabel('X Position (cm)')
-    plt.ylabel('Y Position (cm)')
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    fname = os.path.join(IMAGE_DIRECTORY, f"heatmap_{timestamp}.png")
-    plt.savefig(fname)
-    return fname
-
-# Screens
-
-class IntroScreen(Screen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        layout = AnchorLayout()
-        layout.add_widget(Image(source='/home/furdeengregg/Downloads/Scan.png', size_hint=(None, None), size=(500, 500)))
-        self.add_widget(layout)
-
-    def on_enter(self):
-        Clock.schedule_once(lambda dt: setattr(self.manager, 'current', 'main'), 5)
-
 class MainScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -128,27 +12,28 @@ class MainScreen(Screen):
 
         content = BoxLayout(orientation='horizontal', spacing=10)
         left = BoxLayout(orientation='vertical', spacing=10, size_hint=(0.6, 1))
-        self.image_widget = Image(size_hint=(1, 0.6))
+        self.image_widget = Image(size_hint=(1, 0.7))
         left.add_widget(self.image_widget)
+        left.add_widget(Widget(size_hint=(1, None), height=10))
 
-        # Feedback Box with Background
-        self.feedback_container = BoxLayout(size_hint=(1, None), height=170, padding=10)
-        with self.feedback_container.canvas.before:
-            Color(0.2, 0.2, 0.2, 1)  # dark grey background
-            self.feedback_bg = Rectangle(pos=self.feedback_container.pos, size=self.feedback_container.size)
-        self.feedback_container.bind(pos=self.update_feedback_bg, size=self.update_feedback_bg)
-        self.feedback_label = Label(text="[AI Feedback will appear here]", color=(1, 1, 1, 1), halign="left", valign="top")
-        self.feedback_label.bind(size=self.feedback_label.setter('text_size'))
-        self.feedback_container.add_widget(self.feedback_label)
-        left.add_widget(self.feedback_container)
-
-        self.scanned_image_label = Label(text="", size_hint=(1, None), height=30)
+        self.scanned_image_label = Label(text="Scanning Complete. Heatmap displayed above.", font_size='18sp', size_hint=(1, None), height=30, color=(1, 1, 1, 1))
         left.add_widget(self.scanned_image_label)
+        left.add_widget(Widget(size_hint=(1, None), height=10))
 
-        btn_box = BoxLayout(size_hint=(1, None), height=50)
-        btn_box.add_widget(Button(text="Previous Scans"))
+        self.ai_feedback_label = Label(text="[AI Feedback]", font_size='16sp', size_hint=(1, None), height=140,
+                                       color=(1, 1, 1, 1), halign="left", valign="top")
+        self.ai_feedback_label.bind(size=self.ai_feedback_label.setter('text_size'))
+        with self.ai_feedback_label.canvas.before:
+            Color(0, 0, 0, 1)
+            self.feedback_bg = Rectangle(pos=self.ai_feedback_label.pos, size=self.ai_feedback_label.size)
+        self.ai_feedback_label.bind(pos=self.update_feedback_rect, size=self.update_feedback_rect)
+        left.add_widget(self.ai_feedback_label)
+
+        left.add_widget(Widget(size_hint=(1, None), height=10))
+        btn_box = BoxLayout(size_hint=(1, None), height=50, spacing=10)
         self.scan_btn = Button(text="Scan Now")
         self.scan_btn.bind(on_release=self.start_scan)
+        btn_box.add_widget(Button(text="Previous Scans"))
         btn_box.add_widget(self.scan_btn)
         left.add_widget(btn_box)
 
@@ -156,12 +41,9 @@ class MainScreen(Screen):
         layout.add_widget(content)
         self.add_widget(layout)
 
-    def update_feedback_bg(self, *args):
-        self.feedback_bg.pos = self.feedback_container.pos
-        self.feedback_bg.size = self.feedback_container.size
-
-    def update_velocity_display(self, x, y):
-        print(f"X Velocity: {x:.2f} mm/s, Y Velocity: {y:.2f} mm/s")
+    def update_feedback_rect(self, *args):
+        self.feedback_bg.pos = self.ai_feedback_label.pos
+        self.feedback_bg.size = self.ai_feedback_label.size
 
     def analyze_image_with_ai(self, path):
         try:
@@ -169,6 +51,9 @@ class MainScreen(Screen):
             return r.json() if r.ok else {"error": "Invalid response"}
         except Exception as e:
             return {"error": str(e)}
+
+    def update_velocity_display(self, x, y):
+        print(f"X Velocity: {x:.2f} mm/s, Y Velocity: {y:.2f} mm/s")
 
     def start_scan(self, *_):
         try:
@@ -184,27 +69,16 @@ class MainScreen(Screen):
             self.image_widget.opacity = 1
             result = self.analyze_image_with_ai(path)
             if "error" in result:
-                self.feedback_label.text = f"[AI Error]\n{result['error']}"
+                self.ai_feedback_label.text = f"[AI Error] {result['error']}"
             else:
                 heur = result.get("heuristic", {})
-                caption = "Likely unharmful object, does not need further inspection." if heur.get('threat_score', 0) < 0.5 else "Caution advised. Dense object detected."
-                desc = (f"[AI Feedback]\n"
-                        f"- Object: {heur.get('object', 'N/A')}\n"
-                        f"- Confidence Score: {heur.get('threat_score', 'N/A')}\n"
-                        f"- Sharpness: {heur.get('sharpness', 'N/A')}\n"
-                        f"- Caption: {caption}")
-                self.feedback_label.text = desc
-            self.scanned_image_label.text = "Scanning Complete. Heatmap displayed above."
+                self.ai_feedback_label.text = (
+                    "[AI Feedback]:"
+                    f"\n - Object: {heur.get('object', 'N/A')}"
+                    f"\n - Confidence Score: {heur.get('threat_score', 'N/A')}"
+                    f"\n - Sharpness: {heur.get('sharpness', 'N/A')}"
+                    f"\n - Feedback: {heur.get('feedback', 'No comment')}"
+                )
         except Exception as e:
-            self.feedback_label.text = f"Error: {e}"
+            self.ai_feedback_label.text = f"Error: {e}"
 
-class mmWaveApp(App):
-    def build(self):
-        sm = ScreenManager()
-        sm.add_widget(IntroScreen(name='intro'))
-        sm.add_widget(MainScreen(name='main'))
-        sm.current = 'intro'
-        return sm
-
-if __name__ == '__main__':
-    mmWaveApp().run()
