@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+requests
+opencv-python
+numpy
+pillow
+matplotlib
+seaborn
+kivy
+adafruit-circuitpython-motorkit
+adafruit-circuitpython-ads1x15
